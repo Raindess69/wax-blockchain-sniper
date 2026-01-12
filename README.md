@@ -17,7 +17,8 @@ A direct blockchain interaction tool designed to claim NFT drops from AtomicHub 
 * Cryptography (ECDSA signing)
 
 ### 📦 Wallet Manager (`wax_manager.py`)
-Additional utility to manage assets without Selenium overhead.
+Additional utility to manage assets.
 * **Pure RPC Balance Check:** Fetches token balance directly from `eosio.token` contract.
 * **NFT Indexer API:** Uses AtomicAssets API to discover owned NFTs.
+
 * **Bulk Transfers:** Supports sweeping tokens and NFTs to a cold wallet.
