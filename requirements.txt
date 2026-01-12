@@ -1,0 +1,3 @@
+eospy
+loguru
+requests

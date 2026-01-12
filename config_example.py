@@ -1,0 +1,3 @@
+ACC_PK = 'USER_PVT_KEY'
+CLAIMER = 'ACCOUNT_NAME'
+asset_ids = ['ASSET_ID']
