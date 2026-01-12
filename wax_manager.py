@@ -103,9 +103,9 @@ class WaxManager:
         return self._push_tx("atomicassets", "transfer", data)
 
 def main():
-    # Фейковые данные для теста (Замени на загрузку из конфига!)
+    # Фейковые данные для теста
     MY_ACCOUNT = "mywaxwallet1"
-    DESTINATION = "epaba.wam" # Твой кошелек из скрипта
+    DESTINATION = "XXXX.wam" # кошелек
     # PRIVATE_KEY взять из config
     
     # Инициализация (заглушка ключа для примера)
@@ -135,4 +135,5 @@ def main():
                 manager.transfer_nft(DESTINATION, nfts)
 
 if __name__ == "__main__":
+
     main()
