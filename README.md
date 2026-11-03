@@ -5,7 +5,7 @@
 <br><br>
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](#-install)
-[![pyntelope](https://img.shields.io/badge/serialization-pyntelope%20(local)-F89022)](#-why-pyntelope)
+[![pyntelope](https://img.shields.io/badge/serialization-pyntelope%20%28local%29-F89022)](#-why-pyntelope)
 [![WAX](https://img.shields.io/badge/chain-WAX%20mainnet-F89022)](https://wax.io/)
 [![Tests](https://img.shields.io/badge/tests-12%20passing-2ea44f?logo=pytest&logoColor=white)](#-tests)
 [![Dry run first](https://img.shields.io/badge/every%20write-dry--run%20first-8b5cf6)](#-how-a-claim-works)
