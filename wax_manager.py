@@ -1,139 +1,184 @@
-import sys
-import time
+"""WAX wallet utility: balance, NFT inventory, and sweeping assets to a cold wallet.
+
+Serialization is local (pyntelope); see wax_sniper.py for why the old
+`eospy` / `abi_json_to_bin` approach no longer works on WAX.
+"""
+from __future__ import annotations
+
+from decimal import Decimal, ROUND_DOWN
+from typing import Sequence
+
+import pyntelope as nt
 import requests
-from typing import List, Dict
-
-import eospy.cleos
-import eospy.keys
 from loguru import logger
+from pyntelope import types
 
-# Настройка логера
-logger.remove()
-logger.add(sys.stderr, format="<white>{time:HH:mm:ss}</white> | <level>{message}</level>")
+from wax_sniper import DEFAULT_RPC, WaxError
+
+ATOMIC_API = "https://wax.api.atomicassets.io/atomicassets/v1/assets"
+WAX_PRECISION = 8
+PAGE_SIZE = 1000          # AtomicAssets API maximum
+NFT_BATCH = 100           # assets per transfer action (keeps tx under CPU/size limits)
+
+
+def format_wax(amount: Decimal | str | float) -> str:
+    """Format as an on-chain WAX asset string with exactly 8 decimals (truncating)."""
+    q = Decimal(str(amount)).quantize(Decimal(1).scaleb(-WAX_PRECISION), rounding=ROUND_DOWN)
+    if q <= 0:
+        raise WaxError("amount must be greater than zero")
+    return f"{q:.{WAX_PRECISION}f} WAX"
+
+
+def chunked(seq: Sequence, size: int) -> list[list]:
+    return [list(seq[i:i + size]) for i in range(0, len(seq), size)]
+
 
 class WaxManager:
-    def __init__(self, private_key: str, user_account: str, rpc_url: str = 'https://wax.eos.barcelona'):
-        self.cleos = eospy.cleos.Cleos(url=rpc_url)
-        self.key = eospy.keys.EOSKey(private_key)
-        self.user_account = user_account
-        self.atomic_api = "https://wax.api.atomicassets.io/atomicassets/v1/assets"
+    def __init__(self, private_key: str | None, account: str, rpc_url: str = DEFAULT_RPC,
+                 *, session: requests.Session | None = None):
+        if not account:
+            raise WaxError("account name is required")
+        self.private_key = private_key
+        self.account = account
+        self.net = nt.WaxMainnet() if rpc_url == DEFAULT_RPC else nt.Net(host=rpc_url)
+        self.http = session or requests.Session()
 
-    def get_wax_balance(self) -> float:
-        """Получаем баланс WAX напрямую из блокчейна (без Selenium!)"""
-        try:
-            # Запрос к смарт-контракту eosio.token
-            balance = self.cleos.get_currency_balance('eosio.token', self.user_account, 'WAX')
-            if balance:
-                # balance возвращается как ["100.00000000 WAX"]
-                return float(balance[0].split()[0])
-            return 0.0
-        except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
-            return 0.0
+    # ── reads ────────────────────────────────────────────────────────────
+    def get_wax_balance(self) -> Decimal:
+        """Liquid WAX balance from the eosio.token `accounts` table."""
+        rows = self.net.get_table_rows(
+            code="eosio.token", table="accounts", scope=self.account,
+        )
+        for row in rows:
+            qty, sym = row["balance"].split()
+            if sym == "WAX":
+                return Decimal(qty)
+        return Decimal(0)
 
-    def get_nfts(self) -> List[str]:
-        """Получаем список ID всех NFT на кошельке через Atomic API"""
-        try:
-            params = {
-                "owner": self.user_account,
-                "limit": "100", # Можно увеличить
-                "order": "desc",
-                "sort": "asset_id"
-            }
-            resp = requests.get(self.atomic_api, params=params)
-            data = resp.json()
-            
-            if data['success']:
-                # Возвращаем список ID
-                return [asset['asset_id'] for asset in data['data']]
+    def get_nfts(self, collection: str | None = None) -> list[str]:
+        """Every AtomicAssets NFT the account owns (all pages, not just the first)."""
+        ids: list[str] = []
+        page = 1
+        while True:
+            params = {"owner": self.account, "limit": PAGE_SIZE, "page": page,
+                      "order": "asc", "sort": "asset_id"}
+            if collection:
+                params["collection_name"] = collection
+            resp = self.http.get(ATOMIC_API, params=params, timeout=20)
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("success"):
+                raise WaxError(f"AtomicAssets API error: {body}")
+            batch = [a["asset_id"] for a in body.get("data", [])]
+            ids.extend(batch)
+            if len(batch) < PAGE_SIZE:
+                return ids
+            page += 1
+
+    # ── writes ───────────────────────────────────────────────────────────
+    def _send(self, actions: list[nt.Action], *, dry_run: bool) -> str | None:
+        if not self.private_key:
+            raise WaxError("private key is required to send transactions")
+        linked = nt.Transaction(actions=actions).link(net=self.net)
+        if dry_run:
+            logger.info(f"[dry-run] {len(actions)} action(s) serialized OK — not sent")
+            return None
+        resp = linked.sign(key=self.private_key).send()
+        tx_id = resp.get("transaction_id") if isinstance(resp, dict) else None
+        if not tx_id:
+            raise WaxError(f"transaction rejected: {resp}")
+        logger.success(f"tx {tx_id}")
+        return tx_id
+
+    def _auth(self) -> list[nt.Authorization]:
+        return [nt.Authorization(actor=self.account, permission="active")]
+
+    def transfer_wax(self, to: str, amount: Decimal | str | float, memo: str = "",
+                     *, dry_run: bool = False) -> str | None:
+        quantity = format_wax(amount)
+        logger.info(f"send {quantity} -> {to}")
+        action = nt.Action(
+            account="eosio.token", name="transfer", authorization=self._auth(),
+            data=[
+                nt.Data(name="from", value=types.Name(self.account)),
+                nt.Data(name="to", value=types.Name(to)),
+                nt.Data(name="quantity", value=types.Asset(quantity)),
+                nt.Data(name="memo", value=types.String(memo)),
+            ],
+        )
+        return self._send([action], dry_run=dry_run)
+
+    def transfer_nfts(self, to: str, asset_ids: Sequence[str | int], memo: str = "",
+                      *, dry_run: bool = False) -> list[str | None]:
+        """Send NFTs in batches so big wallets don't blow the tx size/CPU limit."""
+        if not asset_ids:
             return []
-        except Exception as e:
-            logger.error(f"Failed to fetch NFTs: {e}")
-            return []
+        results = []
+        batches = chunked(list(asset_ids), NFT_BATCH)
+        for i, batch in enumerate(batches, 1):
+            logger.info(f"NFT batch {i}/{len(batches)}: {len(batch)} assets -> {to}")
+            action = nt.Action(
+                account="atomicassets", name="transfer", authorization=self._auth(),
+                data=[
+                    nt.Data(name="from", value=types.Name(self.account)),
+                    nt.Data(name="to", value=types.Name(to)),
+                    nt.Data(name="asset_ids", value=types.Array(
+                        values=[types.Uint64(int(a)) for a in batch], type_=types.Uint64)),
+                    nt.Data(name="memo", value=types.String(memo)),
+                ],
+            )
+            results.append(self._send([action], dry_run=dry_run))
+        return results
 
-    def _push_tx(self, contract: str, action: str, data: Dict):
-        """Внутренняя функция отправки (как в Снайпере)"""
-        try:
-            payload = [{
-                'account': contract,
-                'name': action,
-                'authorization': [{
-                    'actor': self.user_account,
-                    'permission': 'active',
-                }],
-                'args': data
-            }]
 
-            bin_data = self.cleos.abi_json_to_bin(payload[0]['account'], payload[0]['name'], payload[0]['args'])
-            payload[0]['data'] = bin_data['binargs']
-            payload[0].pop('args')
+def main() -> int:
+    import config
 
-            trx = {"actions": payload}
-            resp = self.cleos.push_transaction(trx, [self.key])
-            logger.success(f"TX: {resp['transaction_id']}")
-            return True
-        except Exception as e:
-            logger.error(f"TX Error: {e}")
-            return False
+    try:
+        mgr = WaxManager(config.ACC_PK, config.CLAIMER,
+                         getattr(config, "RPC_URL", DEFAULT_RPC))
+        destination = config.COLD_WALLET
+    except AttributeError as exc:
+        logger.error(f"config incomplete: {exc}. See config_example.py")
+        return 1
+    if destination == mgr.account:
+        logger.error("COLD_WALLET must differ from the source account")
+        return 1
 
-    def transfer_wax(self, to_account: str, amount: float, memo: str = ""):
-        """Отправка токенов"""
-        # Форматируем сумму под стандарт WAX (8 знаков после запятой)
-        quantity = "{:.8f} WAX".format(amount)
-        logger.info(f"Sending {quantity} to {to_account}...")
-        
-        data = {
-            "from": self.user_account,
-            "to": to_account,
-            "quantity": quantity,
-            "memo": memo
-        }
-        return self._push_tx("eosio.token", "transfer", data)
+    print(f"Source: {mgr.account}  ->  Cold wallet: {destination}")
+    print("1: Send WAX")
+    print("2: Sweep all NFTs")
+    choice = input("Select: ").strip()
 
-    def transfer_nft(self, to_account: str, asset_ids: List[str], memo: str = ""):
-        """Отправка NFT (AtomicAssets)"""
-        logger.info(f"Sending {len(asset_ids)} NFTs to {to_account}...")
-        
-        data = {
-            "from": self.user_account,
-            "to": to_account,
-            "asset_ids": asset_ids,
-            "memo": memo
-        }
-        return self._push_tx("atomicassets", "transfer", data)
+    try:
+        if choice == "1":
+            bal = mgr.get_wax_balance()
+            logger.info(f"balance: {bal} WAX")
+            if bal <= 0:
+                return 0
+            amount = Decimal(input(f"Amount to send (max {bal}): ").strip())
+            if amount > bal:
+                logger.error("amount exceeds balance")
+                return 1
+            mgr.transfer_wax(destination, amount, dry_run=True)
+            if input("Send for real? Type 'yes': ").strip().lower() == "yes":
+                mgr.transfer_wax(destination, amount)
+        elif choice == "2":
+            nfts = mgr.get_nfts()
+            logger.info(f"found {len(nfts)} NFTs")
+            if not nfts:
+                return 0
+            mgr.transfer_nfts(destination, nfts, dry_run=True)
+            if input(f"Send ALL {len(nfts)} NFTs for real? Type 'yes': ").strip().lower() == "yes":
+                mgr.transfer_nfts(destination, nfts)
+        else:
+            print("Invalid choice")
+            return 1
+    except (WaxError, requests.RequestException) as exc:
+        logger.error(str(exc))
+        return 1
+    return 0
 
-def main():
-    # Фейковые данные для теста
-    MY_ACCOUNT = "mywaxwallet1"
-    DESTINATION = "XXXX.wam" # кошелек
-    # PRIVATE_KEY взять из config
-    
-    # Инициализация (заглушка ключа для примера)
-    manager = WaxManager("5K...Private...Key", MY_ACCOUNT)
-
-    print("1: Sweep WAX (Send all tokens)")
-    print("2: Sweep NFTs (Send all NFTs)")
-    
-    choice = input("Select: ")
-
-    if choice == "1":
-        bal = manager.get_wax_balance()
-        logger.info(f"Current Balance: {bal} WAX")
-        if bal > 0:
-            amount = float(input(f"How much to send? (Max: {bal}): "))
-            manager.transfer_wax(DESTINATION, amount)
-    
-    elif choice == "2":
-        logger.info("Scanning for NFTs...")
-        nfts = manager.get_nfts()
-        logger.info(f"Found {len(nfts)} NFTs")
-        
-        if nfts:
-            confirm = input("Send ALL NFTs? (y/n): ")
-            if confirm.lower() == 'y':
-                # Атомик позволяет отправлять пачкой
-                manager.transfer_nft(DESTINATION, nfts)
 
 if __name__ == "__main__":
-
-    main()
+    raise SystemExit(main())
