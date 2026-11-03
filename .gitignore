@@ -1,0 +1,10 @@
+# Secrets — never commit
+config.py
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
